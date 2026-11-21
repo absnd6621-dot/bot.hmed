@@ -1,0 +1,1040 @@
+"""
+الملف الرئيسي لتشغيل البوت.
+"""
+
+import asyncio
+import logging
+
+from aiogram import Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from config import settings
+from services.html_guard import HtmlGuardedBot
+from database.engine import async_session_maker
+from database.seed import init_db
+
+from middlewares.db_session import DbSessionMiddleware
+from middlewares.user_middleware import UserMiddleware
+from middlewares.subscription_middleware import SubscriptionMiddleware
+from middlewares.state_reset_middleware import StateResetMiddleware
+from middlewares.throttling import GlobalThrottlingMiddleware
+from middlewares.error_middleware import ErrorReportingMiddleware, install_asyncio_exception_handler
+
+from handlers import (
+    start,
+    support,
+    account,
+    agent,
+    cart,
+    referral,
+    referral_guard,
+    session_handler,
+    deposit,
+    transfer,
+    withdrawal,
+    notifications,
+    bot_info,
+    sponsored_ads,
+    special_offers,
+    numbers,
+    loyalty,
+    promotions,
+    product_requests,
+    gift,
+    assistant,
+    status,
+    reviews,
+    webapp,
+    language,
+    currency,
+    challenges,
+    marketplace as user_marketplace,
+    tasks as user_tasks,
+    points as user_points,
+    extras as user_extras,
+    store as user_store,
+    inline_search,
+    ready_codes,
+    ai_sections as user_ai_sections,
+    whatsapp as user_whatsapp,
+    engagement as user_engagement,
+    tg_ready as user_tg_ready,
+    fallback,
+)
+from handlers import merchant as merchant_panel
+from handlers.deposit_methods import router as deposit_methods_router
+from handlers.games import router as games_router
+from handlers.deposit_credit import router as deposit_credit_router
+from handlers.topup_gift import router as topup_gift_router
+from handlers.error_reports import router as error_reports_router
+from handlers.admin import (
+    panel as admin_panel,
+    broadcast as admin_broadcast,
+    channels as admin_channels,
+    countries as admin_countries,
+    deposits as admin_deposits,
+    gift_codes as admin_gift_codes,
+    users as admin_users,
+    pricing as admin_pricing,
+    providers as admin_providers,
+    stats as admin_stats,
+    settings as admin_settings,
+    support as admin_support,
+    categories as admin_categories,
+    products as admin_products,
+    smm_products as admin_smm_products,
+    api_providers as admin_api_providers,
+    audit as admin_audit,
+    health as admin_health,
+    inventory as admin_inventory,
+    loyalty as admin_loyalty,
+    promotions as admin_promotions,
+    coupons as admin_coupons,
+    multi_admin as admin_multi_admin,
+    number_services as admin_number_services,
+    store_servers as admin_store_servers,
+    number_orders as admin_number_orders,
+    features as admin_features,
+    tasks_center as admin_tasks_center,
+    marketplace as admin_marketplace,
+    points as admin_points,
+    operations as admin_ops,
+    bonuses as admin_bonuses,
+    orders as admin_orders,
+    product_requests as admin_product_requests,
+    stars as admin_stars,
+    bot_guide as admin_bot_guide,
+    main_buttons as admin_main_buttons,
+    store_control as admin_store_control,
+    extras_control as admin_extras_control,
+    button_customization as admin_button_customization,
+    agents as admin_agents,
+    margins as admin_margins,
+    withdrawals as admin_withdrawals,
+    notifications as admin_notifications,
+    sponsored_ads as admin_sponsored_ads,
+    special_offers as admin_special_offers,
+    pulled_services as admin_pulled_services,
+    ai_sections as admin_ai_sections,
+    whatsapp as admin_whatsapp,
+    product_routes as admin_product_routes,
+    ledger as admin_ledger,
+    partner_catalog as admin_partner_catalog,
+    live_feed as admin_live_feed,
+    engagement as admin_engagement,
+    campaign_codes as admin_campaign_codes,
+    topup_gifts as admin_topup_gifts,
+    tg_ready as admin_tg_ready,
+    premium_emoji as admin_premium_emoji,
+)
+
+from tasks.order_monitor import (
+    check_pending_orders,
+    update_provider_status,
+    cleanup_balance_locks,
+)
+from tasks.unified_order_monitor import check_unified_orders
+from tasks.cart_reminder import cart_reminder_cycle
+from tasks.dormant_users import dormant_users_cycle
+from tasks.inventory_guard import inventory_guard_cycle
+from tasks.loyalty_chain import loyalty_chain_cycle
+from tasks.weekly_admin_report import weekly_admin_report_cycle
+from tasks.provider_health import provider_health_cycle
+from tasks.invoice_monitor import check_pending_invoices
+from tasks.watch_job import check_product_watches
+from tasks.backup_job import daily_backup
+from tasks.sponsored_ads_job import process_sponsored_ads
+from tasks.special_offers_job import process_special_offers
+from tasks.tenant_monitor import bill_tenant_subscriptions, check_tenant_orders
+from tasks.engagement_jobs import (
+    send_monthly_reports,
+    offer_expiry_cycle,
+    price_alert_cycle,
+    weekly_challenge_cycle,
+)
+from services.feature_service import FeatureService
+from services.smm_sections_service import SmmSectionsService
+from services.subscriptions_sync_service import SubscriptionsSyncService
+from services.marketplace_service import MarketplaceService
+from services.refill_service import RefillService
+from services.drip_feed_service import DripFeedService
+from services.ai_layer_service import AutonomousPurchaseService
+from services.marketplace_ext_service import EscrowService
+from services.subscription_lifecycle_service import SubscriptionLifecycleService
+from services.operations_service import CatalogAutopilotService, FxFeedService
+from services.platform_service import ProviderBiddingService
+from services.bot_command_service import SentinelService
+from services.task_service import TaskService
+from services.observability import init_observability
+from services.plisio_service import plisio_client
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
+init_observability()
+
+bot = HtmlGuardedBot(
+    token=settings.BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+storage = RedisStorage.from_url(settings.REDIS_URL) if settings.REDIS_URL else MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+
+def register_middlewares():
+    db_mw = DbSessionMiddleware()
+    user_mw = UserMiddleware()
+    state_reset_mw = StateResetMiddleware()
+    throttle_mw = GlobalThrottlingMiddleware()
+    sub_mw = SubscriptionMiddleware(bot)
+    error_mw = ErrorReportingMiddleware()
+
+    for observer in (dp.message, dp.callback_query):
+        observer.outer_middleware(error_mw)
+        observer.outer_middleware(db_mw)
+        observer.outer_middleware(user_mw)
+        observer.outer_middleware(sub_mw)
+        observer.outer_middleware(throttle_mw)
+        observer.outer_middleware(state_reset_mw)
+    return throttle_mw
+
+
+def register_routers():
+    # ── هاندلرز المستخدم ──
+    dp.include_router(start.router)
+    dp.include_router(support.router)
+    dp.include_router(account.router)
+    dp.include_router(cart.router)
+    dp.include_router(referral.router)
+    dp.include_router(deposit.router)
+    dp.include_router(deposit_methods_router)
+    dp.include_router(deposit_credit_router)
+    dp.include_router(topup_gift_router)
+    dp.include_router(transfer.router)
+    dp.include_router(withdrawal.router)
+    dp.include_router(notifications.router)
+    dp.include_router(bot_info.router)
+    dp.include_router(sponsored_ads.router)
+    dp.include_router(special_offers.router)
+    dp.include_router(numbers.router)
+    dp.include_router(user_tg_ready.router)
+    dp.include_router(agent.router)
+    dp.include_router(loyalty.router)
+    dp.include_router(promotions.router)
+    dp.include_router(product_requests.router)
+    dp.include_router(gift.router)
+    dp.include_router(assistant.router)
+    dp.include_router(status.router)
+    dp.include_router(reviews.router)
+    dp.include_router(webapp.router)
+    dp.include_router(language.router)
+    dp.include_router(currency.router)
+    dp.include_router(challenges.router)
+    dp.include_router(user_marketplace.router)
+    dp.include_router(user_tasks.router)
+    dp.include_router(user_points.router)
+    dp.include_router(user_extras.router)
+    dp.include_router(user_store.router)
+    dp.include_router(user_engagement.router)
+    dp.include_router(inline_search.router)
+    dp.include_router(games_router)
+    dp.include_router(ready_codes.router)
+    dp.include_router(user_ai_sections.router)
+    dp.include_router(user_whatsapp.router)
+    dp.include_router(referral_guard.router)
+
+    # ── هاندلرز الأدمن ──
+    dp.include_router(admin_panel.router)
+    dp.include_router(admin_broadcast.router)
+    dp.include_router(admin_channels.router)
+    dp.include_router(admin_countries.router)
+    dp.include_router(admin_deposits.router)
+    dp.include_router(admin_gift_codes.router)
+    dp.include_router(admin_users.router)
+    dp.include_router(admin_pricing.router)
+    dp.include_router(admin_providers.router)
+    dp.include_router(admin_stats.router)
+    dp.include_router(admin_ledger.router)
+    dp.include_router(admin_settings.router)
+    dp.include_router(admin_support.router)
+    dp.include_router(admin_categories.router)
+    dp.include_router(admin_products.router)
+    dp.include_router(admin_smm_products.router)
+    dp.include_router(admin_api_providers.router)
+    dp.include_router(admin_pulled_services.router)
+    dp.include_router(admin_ai_sections.router)
+    dp.include_router(admin_whatsapp.router)
+    dp.include_router(admin_partner_catalog.router)
+    dp.include_router(admin_audit.router)
+    dp.include_router(admin_health.router)
+    dp.include_router(admin_inventory.router)
+    dp.include_router(admin_loyalty.router)
+    dp.include_router(admin_promotions.router)
+    dp.include_router(admin_coupons.router)
+    dp.include_router(admin_multi_admin.router)
+    dp.include_router(admin_number_services.router)
+    dp.include_router(admin_store_servers.router)
+    dp.include_router(admin_number_orders.router)
+    dp.include_router(admin_features.router)
+    dp.include_router(admin_tasks_center.router)
+    dp.include_router(admin_marketplace.router)
+    dp.include_router(admin_points.router)
+    dp.include_router(admin_ops.router)
+    dp.include_router(admin_bonuses.router)
+    dp.include_router(admin_orders.router)
+    dp.include_router(admin_product_requests.router)
+    dp.include_router(admin_stars.router)
+    dp.include_router(admin_bot_guide.router)
+    dp.include_router(admin_main_buttons.router)
+    dp.include_router(admin_store_control.router)
+    dp.include_router(admin_extras_control.router)
+    dp.include_router(admin_button_customization.router)
+    dp.include_router(admin_agents.router)
+    dp.include_router(admin_margins.router)
+    dp.include_router(admin_withdrawals.router)
+    dp.include_router(admin_notifications.router)
+    dp.include_router(admin_sponsored_ads.router)
+    dp.include_router(admin_special_offers.router)
+    dp.include_router(admin_live_feed.router)
+    dp.include_router(admin_engagement.router)
+    dp.include_router(admin_product_routes.router)
+    dp.include_router(admin_campaign_codes.router)
+    dp.include_router(admin_topup_gifts.router)
+    dp.include_router(admin_tg_ready.router)
+    dp.include_router(admin_premium_emoji.router)
+
+    # Legacy direct session listener.  Keep it after the ready-sessions uploader:
+    # both accept TXT documents, and the uploader must get the document while
+    # AdminTgReadyStates.waiting_file is active.
+    dp.include_router(session_handler.router)
+
+    # أزرار إشعارات الأخطاء (زر «تم تصليح الخطأ») — قبل fallback ليصل إليها الضغط أولاً.
+    dp.include_router(error_reports_router)
+
+    # آخر Router دائماً: يلتقط أي زر غير مربوط بدل أن يسكت البوت.
+    dp.include_router(merchant_panel.router)
+
+    dp.include_router(fallback.router)
+
+
+async def refill_guarantee_cycle(bot):
+    """ضمان التعويض الآلي: يعوّض هبوط المتابعين خلال فترة الضمان."""
+    from database.engine import async_session_maker
+
+    if not await RefillService.enabled():
+        return
+    async with async_session_maker() as session:
+        await RefillService.run_cycle(session, bot=bot)
+
+
+async def marketplace_maintenance_cycle():
+    """يُفرج عن العمليات المستحقة ويُنتهي الإعلانات منتهية الصلاحية."""
+    from database.engine import async_session_maker
+
+    async with async_session_maker() as session:
+        if await FeatureService.enabled("peer_marketplace"):
+            released = await MarketplaceService.auto_release_due(session)
+            expired = await MarketplaceService.expire_listings(session)
+            if released or expired:
+                logger.info("صيانة السوق: أُفرج %s، انتهى %s", len(released), expired)
+
+
+async def drip_feed_cycle():
+    """ينفّذ دفعات التدريج التي حلّ موعدها."""
+    from database.engine import async_session_maker
+
+    if not await FeatureService.enabled("drip_feed"):
+        return
+    async with async_session_maker() as session:
+        await DripFeedService.run_due(session)
+
+
+async def autonomous_purchase_cycle(bot):
+    """ينفّز دورات وكيل الشراء المستقل، مع فحص السعر قبل الشراء."""
+    from database.engine import async_session_maker
+
+    if not await FeatureService.enabled("autonomous_purchase_agent"):
+        return
+    async with async_session_maker() as session:
+        await AutonomousPurchaseService.run_due(session, bot=bot)
+
+
+async def escrow_expiry_cycle():
+    """يفرج عن الحجوزات التي علقت بلا حسم حتى لا تبقى الأموال مجمّدة."""
+    from database.engine import async_session_maker
+
+    if not await FeatureService.enabled("escrow_engine"):
+        return
+    async with async_session_maker() as session:
+        released = await EscrowService.expire_stale(session, 72)
+        if released:
+            logger.info("أُفرج عن %s حجز ضمان منتهي المهلة.", released)
+
+
+async def subscription_cycle(bot):
+    """ينبّه الاشتراكات المنتهية قريباً ويجدد لمن فعّل التجديد."""
+    from database.engine import async_session_maker
+
+    if not await FeatureService.enabled("subscription_lifecycle"):
+        return
+    async with async_session_maker() as session:
+        await SubscriptionLifecycleService.run_cycle(session, bot=bot)
+
+
+async def catalog_autopilot_cycle():
+    """يعطّل المنتجات المعطوبة ويبلّغ عن فرص المراجحة."""
+    from database.engine import async_session_maker
+
+    if not await FeatureService.enabled("catalog_autopilot"):
+        return
+    async with async_session_maker() as session:
+        disabled = await CatalogAutopilotService.disable_deleted_services(session)
+        if disabled:
+            logger.info("عطّل الكتالوج الذاتي %s منتجاً.", len(disabled))
+
+
+async def fx_refresh_cycle():
+    """يحدّث أسعار الصرف من مصدر خارجي بدل الإدخال اليدوي."""
+    from database.engine import async_session_maker
+
+    if not await FeatureService.enabled("live_fx_feed"):
+        return
+    async with async_session_maker() as session:
+        await FxFeedService.refresh(session)
+
+
+async def sentinel_cycle(bot):
+    """يراقب معدل الأخطاء ويدخل الوضع الآمن قبل أن تتفاقم الخسارة."""
+    from database.engine import async_session_maker
+
+    if not await SentinelService.enabled():
+        return
+    async with async_session_maker() as session:
+        result = await SentinelService.check(session)
+        action = result.get("action")
+
+        if action == "engaged":
+            disabled = result.get("disabled", [])
+            logger.warning("🛡 الحارس أدخل البوت الوضع الآمن: %s", disabled)
+            from services.notification_service import NotificationService
+
+            bullets = "".join(f"• {key}\n" for key in disabled)
+            await NotificationService(bot).notify_admin(
+                "🛡 <b>الحارس الذاتي فعّل الوضع الآمن</b>\n\n"
+                f"معدل الأخطاء: {result.get('error_rate')}\n"
+                f"عُطّلت {len(disabled)} ميزة خطرة:\n"
+                f"{bullets}\n"
+                "ستُعاد تلقائياً حين يستقر المعدل."
+            )
+        elif action == "disengaged":
+            restored = result.get("restored", [])
+            logger.info("🛡 الحارس أخرج البوت من الوضع الآمن.")
+            from services.notification_service import NotificationService
+
+            await NotificationService(bot).notify_admin(
+                "✅ <b>استقر الوضع — خرج البوت من الوضع الآمن</b>\n\n"
+                f"أُعيدت {len(restored)} ميزة."
+            )
+
+
+async def bid_cleanup_cycle():
+    """ينظّف عروض المزايدة المنتهية."""
+    from database.engine import async_session_maker
+
+    if not await FeatureService.enabled("provider_bidding"):
+        return
+    async with async_session_maker() as session:
+        await ProviderBiddingService.cleanup_expired(session)
+
+
+async def wa_bridge_health_cycle(bot):
+    """صحة جسر واتساب: تنبيه الأدمن عند انقطاع البوت الثاني وعند عودته.
+
+    بدون هذا الفحص يبقى عطب الجسر صامتاً: المستخدمون يرون رسالة خطأ فقط،
+    ولا يعرف الأدمن أن القسم كله واقف إلا من الشكاوى.
+    """
+    from services.whatsapp_section_service import WhatsAppSectionService
+
+    if not await FeatureService.enabled("whatsapp_section"):
+        return
+    try:
+        await WhatsAppSectionService.bridge_health(bot=bot)
+    except Exception:  # noqa: BLE001 — المراقبة لا تُسقط البوت
+        logger.exception("فشل فحص جسر واتساب")
+
+
+async def wa_renewal_cycle():
+    """قسم واتساب: تجديد تلقائي للباقات قرب انتهائها + تنبيه الانتهاء."""
+    from database.engine import async_session_maker
+
+    from services.whatsapp_section_service import WhatsAppSectionService
+
+    if not await FeatureService.enabled("whatsapp_section"):
+        return
+    try:
+        async with async_session_maker() as session:
+            await WhatsAppSectionService.renewal_cycle(session, bot=bot)
+    except Exception:
+        logger.exception("فشل دورة تجديد قسم واتساب")
+
+
+async def agent_weekly_cycle(bot):
+    """فحص أسبوعي لبرنامج الوكلاء: سحب من أقل إيداعاته الأسبوعية من الحد."""
+    from database.engine import async_session_maker
+    from services.agent_service import AgentService
+
+    if not await FeatureService.enabled("agent_program"):
+        return
+    try:
+        async with async_session_maker() as session:
+            await AgentService.check_weekly_deposits(session, bot)
+    except Exception:
+        logger.exception("فشل فحص الوكلاء الأسبوعي")
+
+
+async def availability_board_cycle(bot):
+    """التوفر المتقطع: يحدّث لوحة الدول الجاهزة في القناة الحية كل دورة.
+
+    كل دورة تُقرأ أحدث بيانات المزود فيرى المستخدم ما هو متوفر الآن فعلاً
+    (دول تتوفر فجأة تظهر فوراً وتختفي الدول التي نفدت). التحديث يتم
+    بتعديل نفس الرسالة، لكن اللوحة تُعاد نشرها كرسالة جديدة كل عدد محدد
+    من الدورات (repost_every_cycles) — لأن تعديل رسالة في Telegram لا
+    يُصدر إشعاراً ويبقى مدفوناً تحت أي منشور أحدث — فتظهر بأعلى القناة
+    ويصل المشتركين إشعار فعلي.
+    """
+    if not await FeatureService.enabled("numbers_availability_board"):
+        return
+    from services.availability_board_service import AvailabilityBoardService
+
+    try:
+        await AvailabilityBoardService.post_board(bot)
+    except Exception:
+        logger.exception("فشل نشر لوحة التوفر المتقطع")
+
+
+async def prune_feature_events():
+    """يحذف أحداث القياس القديمة حسب المدة التي حددها الأدمن."""
+    days = await FeatureService.config_int("feature_usage_analytics", "retention_days", 90)
+    removed = await FeatureService.prune_events(days)
+    if removed:
+        logger.info("حُذفت %s من أحداث القياس القديمة.", removed)
+
+
+async def failover_decay_cycle():
+    """يتلاشى عدّاد فشل auto_failover مع الوقت لمنع الإغلاق الدائم."""
+    from services.auto_failover_service import AutoFailoverService
+
+    if not await AutoFailoverService.enabled():
+        return
+    try:
+        removed = await AutoFailoverService.decay()
+        if removed:
+            logger.info("auto_failover: تلاشت %d عدادات فشل.", removed)
+    except Exception:
+        logger.exception("فشل دورة تلاشي عدادات auto_failover")
+
+
+async def start_scheduler(throttle_mw=None) -> AsyncIOScheduler:
+    scheduler = AsyncIOScheduler()
+
+    def _add(func, trigger, **kwargs):
+        # منع تراكب نفس المهمة عند بطء الشبكة/DB: نسخة واحدة فقط + دمج الفائت
+        kwargs.setdefault("max_instances", 1)
+        kwargs.setdefault("coalesce", True)
+        kwargs.setdefault("misfire_grace_time", 300)
+        return scheduler.add_job(func, trigger, **kwargs)
+
+    order_poll_seconds = max(
+        10,
+        await FeatureService.config_int(
+            "instant_delivery", "poll_interval_seconds", 30
+        ),
+    )
+    _add(
+        check_pending_orders,
+        "interval",
+        seconds=order_poll_seconds,
+        args=[bot],
+    )
+
+    _add(
+        check_unified_orders,
+        "interval",
+        minutes=2,
+        args=[bot],
+    )
+
+    _add(
+        check_pending_invoices,
+        "interval",
+        seconds=max(15, settings.PLISIO_POLLING_INTERVAL_SECONDS),
+        args=[bot],
+    )
+
+    _add(
+        update_provider_status,
+        "interval",
+        minutes=10,
+        args=[bot],
+    )
+
+    _add(
+        check_product_watches,
+        "interval",
+        minutes=10,
+        args=[bot],
+    )
+
+    _add(
+        cleanup_balance_locks,
+        "interval",
+        minutes=5,
+    )
+
+    _add(
+        daily_backup,
+        "cron",
+        hour=3,
+        minute=0,
+        args=[bot],
+    )
+
+    _add(
+        refill_guarantee_cycle,
+        "interval",
+        hours=6,
+        args=[bot],
+    )
+
+    _add(
+        marketplace_maintenance_cycle,
+        "interval",
+        minutes=30,
+    )
+
+    _add(
+        prune_feature_events,
+        "cron",
+        hour=4,
+        minute=30,
+    )
+
+    _add(
+        drip_feed_cycle,
+        "interval",
+        minutes=5,
+    )
+
+    _add(
+        autonomous_purchase_cycle,
+        "interval",
+        minutes=15,
+        args=[bot],
+    )
+
+    _add(
+        escrow_expiry_cycle,
+        "interval",
+        hours=1,
+    )
+
+    _add(
+        subscription_cycle,
+        "cron",
+        hour=8,
+        minute=0,
+        args=[bot],
+    )
+
+    _add(
+        catalog_autopilot_cycle,
+        "interval",
+        hours=6,
+    )
+
+    _add(
+        fx_refresh_cycle,
+        "interval",
+        minutes=60,
+    )
+
+    _add(
+        bid_cleanup_cycle,
+        "interval",
+        minutes=30,
+    )
+
+    # قسم واتساب: تجديد تلقائي اليومي + تنبيه الانتهاء (كل ساعة).
+    _add(
+        wa_renewal_cycle,
+        "interval",
+        hours=1,
+    )
+
+    # قسم واتساب: صحة جسر البوت الثاني — إنذار الأدمن عند انقطاعه (كل 10 دقائق).
+    _add(
+        wa_bridge_health_cycle,
+        "interval",
+        minutes=10,
+        args=[bot],
+    )
+
+    # التوفر المتقطع: كل دورة (افتراضياً 5 دقائق) تُحذف اللوحة وتُنشأ بأحدث
+    # الدول الجاهزة فوراً من المزود. النشر كل دقيقة كان يسبب FloodWait
+    # وإزعاج المشتركين — الحد الأدنى الآن 3 دقائق.
+    _add(
+        availability_board_cycle,
+        "interval",
+        seconds=max(
+            180,
+            await FeatureService.config_int(
+                "numbers_availability_board", "refresh_seconds", 300
+            ),
+        ),
+        args=[bot],
+    )
+
+    # برنامج الوكلاء: فحص دوري (افتراضياً كل 6 ساعات) لسحب وكالات
+    # الوكلاء الذين أقل إيداعهم الأسبوعي من الحد.
+    _add(
+        agent_weekly_cycle,
+        "interval",
+        hours=max(
+            1,
+            await FeatureService.config_int("agent_program", "check_interval_hours", 6),
+        ),
+        args=[bot],
+    )
+
+    _add(
+        sentinel_cycle,
+        "interval",
+        minutes=5,
+        args=[bot],
+    )
+
+    _add(
+        process_sponsored_ads,
+        "interval",
+        minutes=5,
+        args=[bot],
+    )
+
+    _add(
+        process_special_offers,
+        "interval",
+        minutes=5,
+        args=[bot],
+    )
+
+    # ميزات التفاعل الجديدة.
+    _add(
+        send_monthly_reports,
+        "cron",
+        hour=9,
+        minute=0,
+        args=[bot],
+    )
+
+    _add(
+        offer_expiry_cycle,
+        "interval",
+        minutes=15,
+        args=[bot],
+    )
+
+    _add(
+        price_alert_cycle,
+        "interval",
+        minutes=max(
+            1,
+            await FeatureService.config_int("price_alerts", "check_interval_minutes", 5),
+        ),
+        args=[bot],
+    )
+
+    _add(
+        weekly_challenge_cycle,
+        "interval",
+        hours=1,
+    )
+
+    # تذكير السلة المتروكة: دورة كل ساعة، والمهلة داخل الخدمة (افتراضياً ٦ ساعات).
+    scheduler.add_job(
+        cart_reminder_cycle,
+        "interval",
+        minutes=max(
+            30,
+            await FeatureService.config_int("cart_reminder", "check_interval_minutes", 60),
+        ),
+        args=[bot],
+    )
+
+    # العملاء النائمون: تذكير «اشتقنا لك» مرة واحدة لكل مستخدم غائب.
+    scheduler.add_job(
+        dormant_users_cycle,
+        "interval",
+        hours=max(
+            1,
+            await FeatureService.config_int("dormant_users", "check_interval_hours", 24),
+        ),
+        args=[bot],
+    )
+
+    # صحة أرصدة المزودين: تنبيه مبكر + مدة الصمود قبل توقف البيع.
+    scheduler.add_job(
+        provider_health_cycle,
+        "interval",
+        hours=max(
+            1,
+            await FeatureService.config_int(
+                "provider_health_watch", "check_interval_hours", 6
+            ),
+        ),
+        args=[bot],
+    )
+
+    # التقرير الأسبوعي للأدمن: كل اثنين التاسعة صباحاً (يُمنع التكرار بمفتاح الأسبوع).
+    scheduler.add_job(
+        weekly_admin_report_cycle,
+        "cron",
+        day_of_week=(
+            await FeatureService.config("weekly_admin_report", "day_of_week", "mon")
+        ),
+        hour=max(0, min(23, await FeatureService.config_int("weekly_admin_report", "hour", 9))),
+        minute=0,
+        args=[bot],
+    )
+
+    # سلسلة الولاء: كوبون خصم متصاعد لمن أكثر الطلب هذا الشهر.
+    scheduler.add_job(
+        loyalty_chain_cycle,
+        "interval",
+        hours=max(
+            1,
+            await FeatureService.config_int("loyalty_chain", "check_interval_hours", 6),
+        ),
+        args=[bot],
+    )
+
+    # حارس المخزون: تنبيه عند النفاد + إخفاء تلقائي + إعادة تلقائية.
+    scheduler.add_job(
+        inventory_guard_cycle,
+        "interval",
+        minutes=max(
+            5,
+            await FeatureService.config_int("stock_guard", "check_interval_minutes", 30),
+        ),
+        args=[bot],
+    )
+
+    # auto_failover: تلاشي عدادات الفشل تدريجياً حسب إعداد الميزة.
+    _add(
+        failover_decay_cycle,
+        "interval",
+        minutes=max(
+            10,
+            await FeatureService.config_int(
+                "auto_failover", "decay_interval_minutes", 60
+            ),
+        ),
+    )
+
+    if throttle_mw is not None:
+        def _throttle_cleanup():
+            try:
+                removed = throttle_mw.cleanup()
+                if removed:
+                    logger.info("throttle cleanup: أُزيل %s مفتاحاً خاملاً.", removed)
+            except Exception:
+                pass
+
+            try:
+                from services.balance_service import BalanceService
+
+                BalanceService.cleanup_idle_locks()
+            except Exception:
+                pass
+
+            try:
+                from services.operation_lock_service import OperationLockService
+
+                asyncio.get_running_loop().create_task(OperationLockService.cleanup())
+            except Exception:
+                pass
+
+        _add(_throttle_cleanup, "interval", minutes=5)
+
+    async def _tenant_orders_cycle():
+        try:
+            await check_tenant_orders()
+        except Exception:
+            logger.exception("فشل دورة طلبات الفروع")
+
+    async def _tenant_billing_cycle(bot):
+        try:
+            await bill_tenant_subscriptions(bot)
+        except Exception:
+            logger.exception("فشل فوترة المستأجرين")
+
+    _add(_tenant_orders_cycle, "interval", minutes=2)
+    _add(_tenant_billing_cycle, "cron", hour=9, minute=30, args=[bot])
+
+    scheduler.start()
+    return scheduler
+
+
+async def main():
+    logger.info("⏳ جاري تهيئة قاعدة البيانات...")
+    # فشل سريع إن بقي SQLite في الإنتاج — يحمي من تشغيل حاويتين على ملف واحد
+    db_url = (settings.DATABASE_URL or "").lower()
+    if settings.ENVIRONMENT == "production" and db_url.startswith("sqlite"):
+        logger.error(
+            "DATABASE_URL ما زال sqlite في بيئة production — ارفض الإقلاع "
+            "لمنع فساد الرصيد. اضبط Postgres في .env."
+        )
+        raise RuntimeError("Refusing to run production on SQLite")
+    if settings.ENVIRONMENT == "production" and "change_me" in (settings.DATABASE_URL or ""):
+        logger.error("كلمة سر قاعدة البيانات ما زالت الافتراضية change_me — ارفض الإقلاع.")
+        raise RuntimeError("Refusing to run production with default DB password")
+    if not settings.INVENTORY_ENCRYPTION_KEY:
+        logger.warning(
+            "INVENTORY_ENCRYPTION_KEY غير مضبوط — رفع الجلسات الجاهزة مرفوض "
+            "حتى يُضبط (Fail-closed)."
+        )
+    await init_db()
+    # ترقيات alembic تستدعي fileConfig من alembic.ini (root=WARN) فتمسح
+    # إعداد السجلات — نعيد ضبطها هنا ليبقى INFO ظاهراً أثناء التشغيل.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
+    )
+    await FeatureService.sync_registry()
+    await FeatureService.reload()
+    # ترميم أسماء الدول الأجنبية (من المزود) إلى العربية + العلم الصحيح.
+    # لا يلمس أكواد الربط مع المزودين إطلاقاً.
+    try:
+        from services.country_localization_service import heal_countries
+
+        async with async_session_maker() as session:
+            healed = await heal_countries(session)
+            if healed:
+                logger.info("🌍 عُرّبت %s دولة أجنبية.", healed)
+    except Exception:
+        logger.exception("فشل ترميم أسماء الدول")
+
+    # ترقيم سيرفرات الأرقام: المستخدم يجب ألا يرى اسم المزود (5sim/HeroSMS...)
+    # بل «سيرفر 1، سيرفر 2...». القواعد القديمة حفظت أسماء المزودين، فنعيد
+    # ترقيمها مرة واحدة عند الإقلاع.
+    try:
+        from services.number_server_service import NumberServerService
+
+        async with async_session_maker() as session:
+            renamed = await NumberServerService.renumber_all(session)
+            if renamed:
+                logger.info("🖥 أُعيد ترقيم سيرفرات %s خدمة أرقام.", renamed)
+    except Exception:
+        logger.exception("فشل ترقيم سيرفرات الأرقام")
+
+    async with async_session_maker() as session:
+        await TaskService.seed_defaults(session)
+
+    async def _deferred_heavy_startup():
+        # مهام ثقيلة خارج المسار الحرج: تعمل بعد بدء الـ polling بثلاث دقائق
+        # حتى لا يتجمد الإقلاع عند بطء مزود خارجي.
+        await asyncio.sleep(180)
+        try:
+            async with async_session_maker() as session:
+                if await SmmSectionsService.auto_build_enabled():
+                    if await SmmSectionsService.upgrade_legacy_limit():
+                        logger.info("⬆️ رُفع حد النشر التلقائي لأقسام الرشق من 5 إلى 10.")
+                    report = await SmmSectionsService.build(session)
+                    logger.info("🚀 البناء التلقائي لأقسام الرشق: %s", report)
+        except Exception:
+            logger.exception("فشل البناء التلقائي لأقسام الرشق (مؤجل)")
+        try:
+            from services.junk_products_service import JunkProductsService
+
+            async with async_session_maker() as session:
+                junk_report = await JunkProductsService.clean(session)
+                if junk_report.changed:
+                    logger.info(
+                        "🧹 تنظيف منتجات «سيرفر» الوهمية: حُذف %s ونُشر %s بديلاً.",
+                        junk_report.deleted,
+                        junk_report.replaced,
+                    )
+        except Exception:
+            logger.exception("فشل تنظيف منتجات «سيرفر» الوهمية (مؤجل)")
+        try:
+            async with async_session_maker() as session:
+                if await SubscriptionsSyncService.enabled() and await SubscriptionsSyncService.auto_on_startup():
+                    try:
+                        reports = await asyncio.wait_for(
+                            SubscriptionsSyncService.sync_all(session), timeout=300
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("مزامنة الاشتراكات تجاوزت 5 دقائق — أُجهضت.")
+                        return
+                    for report in reports:
+                        logger.info("🛍 مزامنة الاشتراكات: %s", report)
+        except Exception:
+            logger.exception("فشل مزامنة الاشتراكات الرقمية (مؤجل)")
+
+    # ── بناء أقسام الرشق الداخلية تلقائياً ──
+    # (نُقل للخلفية — انظر _deferred_heavy_startup أعلاه)
+    # ── تنظيف منتجات «سيرفر» الوهمية تلقائياً ──
+    # (نُقل للخلفية)
+    # ── مزامنة الاشتراكات الرقمية (ggsoma) تلقائياً ──
+    # (نُقلت للخلفية بمهلة 5 دقائق)
+
+    logger.info(f"🔑 آيديات الأدمن: {settings.admin_ids_list}")
+    logger.info("✅ قاعدة البيانات جاهزة.")
+
+    throttle_mw = register_middlewares()
+    register_routers()
+    install_asyncio_exception_handler(bot)
+    scheduler = await start_scheduler(throttle_mw)
+    asyncio.create_task(_deferred_heavy_startup())
+
+    logger.info("🚀 البوت يعمل الآن...")
+    try:
+        # زر القائمة: /start للجميع (غير قاتل إن تعذرت الشبكة).
+        try:
+            from services.bot_menu_service import sync_bot_menu
+
+            await sync_bot_menu(bot)
+        except Exception:
+            logger.warning("تخطي مزامنة زر القائمة هذه المرة.")
+        # الشبكة نحو api.telegram.org قد تكون متقطعة (Connection reset).
+        # نعيد المحاولة عدة مرات، وإن فشلت كلها نتابع للـ polling بدل أن يسقط البوت.
+        for attempt in range(1, 6):
+            try:
+                # لا تُسقط التحديثات المعلقة: successful_payment (نجوم) قد يصل
+                # أثناء إعادة التشغيل، وإسقاطه يعني دفعاً بلا شحن.
+                await bot.delete_webhook(drop_pending_updates=False, request_timeout=20)
+                break
+            except Exception as exc:
+                logger.warning("تعذّر حذف الـ webhook (محاولة %s/5): %s", attempt, exc)
+                if attempt >= 5:
+                    logger.warning("المتابعة إلى الـ polling بدون حذف الـ webhook.")
+                    break
+                await asyncio.sleep(3 * attempt)
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown(wait=False)
+        await plisio_client.close()
+        await bot.session.close()
+        if hasattr(storage, "close"):
+            await storage.close()
+        logger.info("🛑 البوت توقف.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

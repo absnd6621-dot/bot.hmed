@@ -1,0 +1,546 @@
+"""
+صفحة حساب المستخدم.
+تعرض الرصيد بالدولار، الطلبات، سجل المعاملات.
+"""
+from html import escape
+from aiogram import Router, F
+from aiogram.fsm.context import FSMContext
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy import select, func, desc
+from sqlalchemy.orm import selectinload
+from database.models import User, NumberOrder, UnifiedOrder, DigitalInventoryItem, ProductReview, OrderStatus, UnifiedOrderStatus, ProductStatus
+from services.balance_service import BalanceService
+from services.i18n_service import I18nService
+from services.cashback_service import CashbackService
+from services.inventory_service import InventoryError, InventoryService
+from services.receipt_service import ReceiptService
+from services.watch_service import WatchService
+from keyboards.games import product_confirm_kb
+from keyboards.common import empty_state_kb
+router = Router(name='account')
+
+
+def _auto_lang(scope=None) -> str:
+    user = (scope or {}).get("db_user")
+    if user is None:
+        callback = (scope or {}).get("callback")
+        user = getattr(callback, "from_user", None)
+    return getattr(user, "language_code", "ar") or "ar"
+
+def _merge_kb(top, bottom):
+    """يلصق لوحة تحت أخرى (فلاتر + مخارج الشاشة الفارغة)."""
+    from aiogram.types import InlineKeyboardMarkup as _Markup
+
+    return _Markup(inline_keyboard=[*top.inline_keyboard, *bottom.inline_keyboard])
+
+
+def _account_kb(language: str='ar'):
+    t = lambda key: I18nService.t(key, language)
+    from services.button_customization_service import ButtonCustomizationService as BC
+    from aiogram.types import InlineKeyboardMarkup
+    rows = [
+        [BC.apply("account.number_orders", t('acct_number_orders'), 'my_num_orders:0', "primary"),
+         BC.apply("account.other_orders", t('acct_other_orders'), 'my_uni_orders:0', "primary")],
+        [BC.apply("account.transactions", t('acct_transactions'), 'my_transactions:0', "primary"),
+         BC.apply("account.watches", t('acct_watches'), 'my_watches', "primary")],
+        [BC.apply("account.currency", t('acct_currency'), 'menu:currency', None),
+         BC.apply("account.language", t('acct_language'), 'menu:language', None)],
+        [BC.apply("account.repeat_last", '🔁 إعادة آخر طلب', 'repeat_last', "success")],
+        [BC.apply("account.back", t('back_to_main'), 'back_to_main', None)],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def _label(mapping: dict, value, language: str):
+    """يرجع نص الحالة/النوع بلغة المستخدم (قوائم ar/en)."""
+    entry = mapping.get(value)
+    if isinstance(entry, dict):
+        return entry.get(language, entry.get('ar', str(value)))
+    return entry if entry is not None else str(value)
+ORDER_STATUS_LABELS = {OrderStatus.PENDING: {'ar': '⏳ قيد الانتظار', 'en': '⏳ Pending'}, OrderStatus.CODE_RECEIVED: {'ar': '✅ وصل الكود', 'en': '✅ Code received'}, OrderStatus.COMPLETED: {'ar': '✅ مكتمل', 'en': '✅ Completed'}, OrderStatus.EXPIRED: {'ar': '⌛ انتهت الصلاحية', 'en': '⌛ Expired'}, OrderStatus.CANCELLED: {'ar': '❌ ملغى', 'en': '❌ Cancelled'}, OrderStatus.REFUNDED: {'ar': '↩️ مسترجَع', 'en': '↩️ Refunded'}}
+UNIFIED_STATUS_LABELS = {UnifiedOrderStatus.PENDING: {'ar': '⏳ قيد الانتظار', 'en': '⏳ Pending'}, UnifiedOrderStatus.PROCESSING: {'ar': '🔄 قيد التنفيذ', 'en': '🔄 Processing'}, UnifiedOrderStatus.COMPLETED: {'ar': '✅ مكتمل', 'en': '✅ Completed'}, UnifiedOrderStatus.FAILED: {'ar': '❌ فشل', 'en': '❌ Failed'}, UnifiedOrderStatus.REFUNDED: {'ar': '↩️ مسترجَع', 'en': '↩️ Refunded'}, UnifiedOrderStatus.PARTIAL: {'ar': '⚠️ جزئي', 'en': '⚠️ Partial'}}
+TRANSACTION_TYPE_LABELS = {
+    'deposit': {'ar': '💰 إيداع', 'en': '💰 Deposit'},
+    'purchase': {'ar': '🛒 شراء', 'en': '🛒 Purchase'},
+    'refund': {'ar': '↩️ استرجاع', 'en': '↩️ Refund'},
+    'referral_bonus': {'ar': '💎 مكافأة إحالة', 'en': '💎 Referral bonus'},
+    'transfer_in': {'ar': '📥 تحويل وارد', 'en': '📥 Incoming transfer'},
+    'transfer_out': {'ar': '📤 تحويل صادر', 'en': '📤 Outgoing transfer'},
+    'admin_add': {'ar': '➕ إضافة (أدمن)', 'en': '➕ Admin credit'},
+    'admin_deduct': {'ar': '➖ خصم (أدمن)', 'en': '➖ Admin debit'},
+    'cashback': {'ar': '🎁 كاشباك', 'en': '🎁 Cashback'},
+    'stars_deposit': {'ar': '⭐ نجوم تليجرام', 'en': '⭐ Telegram Stars'},
+    'coupon_bonus': {'ar': '🎟 كوبون', 'en': '🎟 Coupon'},
+    'loyalty_redeem': {'ar': '🎁 استبدال نقاط الولاء', 'en': '🎁 Loyalty redemption'},
+    'gift_redeem': {'ar': '🎁 كود هدية', 'en': '🎁 Gift code'},
+}
+
+@router.message(F.text == '👤 حسابي')
+async def account_handler(message: Message, session, db_user: User):
+    await _send_account(message, session, db_user)
+
+@router.callback_query(F.data == 'menu:account')
+async def account_handler_cb(callback: CallbackQuery, session, db_user: User):
+    await callback.answer()
+    await _send_account(callback.message, session, db_user)
+
+async def _send_account(message: Message, session, db_user: User):
+    from services.currency_service import CurrencyService
+    language = db_user.language_code
+    t = lambda key, **kw: I18nService.t(key, language, **kw)
+    result = await session.execute(select(func.count(User.id)).where(User.referrer_id == db_user.id))
+    referrals_count = result.scalar_one()
+    total_cashback = await CashbackService.get_user_total_cashback(session, db_user.id)
+    kb_markup = _account_kb(language)
+    balance_display = await CurrencyService.format_dual(db_user.balance, db_user, session)
+    balance_syp_note = await CurrencyService.syp_note(db_user.balance, db_user, session)
+    balance_line = balance_display + balance_syp_note
+    # «إجمالي مشترياتك» = ما اكتمل وتفعّل فعلاً فقط (الأرقام بعد التفعيل،
+    # والرشق/الألعاب بعد الاكتمال) — لا الطلبات المعلّقة ولا المسترجَعة،
+    # لأن المستخدم يدفع مسبقاً وقد يُرجع رصيده إذا لم يتفعّل الطلب.
+    from services.ledger_service import LedgerService
+
+    realized_spent, realized_orders = await LedgerService.user_realized_totals(
+        session, db_user.id
+    )
+    spent_display = await CurrencyService.format_dual(realized_spent, db_user, session)
+    cashback_display = await CurrencyService.format_dual(total_cashback, db_user, session)
+
+    vip_line = ""
+    try:
+        from services.feature_service import FeatureService
+        from services.vip_service import VipService
+
+        if await VipService.enabled() and await VipService.show_in_profile():
+            tier = await VipService.tier_for(realized_spent)
+            vip_line = f"👑 {('مستوى' if language.startswith('ar') else 'Tier')}: <b>{tier.name}</b> · كاشباك ×{tier.cashback_mult}\n\n"
+    except Exception:
+        pass
+
+    await message.answer(vip_line + t('account_card', user_id=db_user.telegram_id, balance=balance_line, spent=spent_display, orders=realized_orders, cashback=cashback_display, points=db_user.loyalty_points, referrals=referrals_count, joined=db_user.joined_at.strftime('%Y-%m-%d')), reply_markup=kb_markup)
+
+@router.callback_query(F.data == 'my_watches')
+async def my_watches(callback: CallbackQuery, session, db_user: User):
+    watches = await WatchService.list_user_watches(session, db_user.id)
+    await callback.answer()
+    if not watches:
+        await callback.message.edit_text(I18nService.t('ux_account_146_1', _auto_lang(locals())), reply_markup=_account_kb())
+        return
+    lines = ['🔔 <b>تنبيهاتي</b>\n', 'سنخبرك عند انخفاض السعر أو عودة المخزون:']
+    kb = InlineKeyboardBuilder()
+    for watch in watches:
+        if watch.product:
+            lines.append(f'\n📦 {watch.product.name_ar} · {watch.product.price_usd}$')
+            kb.button(text=f'🔕 إلغاء {watch.product.name_ar[:25]}', callback_data=f'watch:toggle:{watch.product_id}')
+    kb.button(text='🔙 رجوع لحسابي', callback_data='menu:account')
+    kb.adjust(1)
+    await callback.message.edit_text('\n'.join(lines), reply_markup=kb.as_markup())
+
+
+# ══════════════ مرشّحات الطلبات حسب الحالة ══════════════
+# «عندي ٣٠ طلب، وين اللي ما خلص؟» — بدل التنقيب في الصفحات، فلاتر جاهزة.
+UNIFIED_FILTERS: dict[str, tuple[str, tuple]] = {
+    "all": ("📋 الكل", None),
+    "active": ("⏳ قيد التنفيذ", (UnifiedOrderStatus.PENDING, UnifiedOrderStatus.PROCESSING)),
+    "completed": ("✅ مكتمل", (UnifiedOrderStatus.COMPLETED,)),
+    "closed": ("↩️ ملغى/مسترجع", (UnifiedOrderStatus.FAILED, UnifiedOrderStatus.REFUNDED)),
+}
+NUMBER_FILTERS: dict[str, tuple[str, tuple]] = {
+    "all": ("📋 الكل", None),
+    "active": ("⏳ بانتظار الكود", (OrderStatus.PENDING,)),
+    "completed": ("✅ مكتمل", (OrderStatus.CODE_RECEIVED, OrderStatus.COMPLETED)),
+    "closed": ("↩️ منتهي/مسترجع", (OrderStatus.EXPIRED, OrderStatus.CANCELLED, OrderStatus.REFUNDED)),
+}
+
+
+def _parse_orders_page(data: str) -> tuple[int, str]:
+    """يقرأ (رقم الصفحة، المرشّح) من callback_data."""
+    parts = data.split(":")
+    page = 0
+    try:
+        page = int(parts[1])
+    except (IndexError, ValueError):
+        page = 0
+    status_filter = parts[2] if len(parts) > 2 and parts[2] in UNIFIED_FILTERS else "all"
+    return max(0, page), status_filter
+
+
+def _add_filter_row(kb: InlineKeyboardBuilder, prefix: str, current: str, labels: dict) -> None:
+    """صفّ الفلاتر: الزرّ الحالي موسوم بـ ✓."""
+    for key, (label, _statuses) in labels.items():
+        text = f"✓ {label}" if key == current else label
+        kb.button(
+            text=text,
+            callback_data=f"{prefix}:0:{key}",
+            style="success" if key == current else None,
+        )
+
+
+@router.callback_query(F.data.startswith('my_num_orders:'))
+async def my_number_orders(callback: CallbackQuery, session, db_user: User):
+    page, status_filter = _parse_orders_page(callback.data)
+    if status_filter not in NUMBER_FILTERS:
+        status_filter = "all"
+    _label_text, statuses = NUMBER_FILTERS[status_filter]
+    per_page = 5
+    where = [NumberOrder.user_id == db_user.id]
+    if statuses:
+        where.append(NumberOrder.status.in_(statuses))
+    result = await session.execute(select(NumberOrder).where(*where).order_by(desc(NumberOrder.purchased_at)).limit(per_page).offset(page * per_page))
+    orders = result.scalars().all()
+    total_result = await session.execute(select(func.count(NumberOrder.id)).where(*where))
+    total = total_result.scalar_one()
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    suffix = f":{status_filter}"
+    if not orders and page == 0:
+        kb = InlineKeyboardBuilder()
+        _add_filter_row(kb, "my_num_orders", status_filter, NUMBER_FILTERS)
+        kb.adjust(2)
+        empty_text = (
+            I18nService.t('ux_account_189_2', _auto_lang(locals()))
+            if status_filter == "all"
+            else "📭 لا توجد طلبات أرقام بهذه الحالة."
+        )
+        await callback.message.edit_text(
+            empty_text,
+            reply_markup=_merge_kb(
+                kb.as_markup(),
+                empty_state_kb(
+                    language=db_user.language_code,
+                    back_callback="num_hub",
+                    back_label="📞 اطلب رقم الآن",
+                ),
+            ),
+        )
+        await callback.answer()
+        return
+    lines = [f'📋 <b>طلبات الأرقام ({page + 1}/{total_pages})</b>\n']
+    kb = InlineKeyboardBuilder()
+    _add_filter_row(kb, "my_num_orders", status_filter, NUMBER_FILTERS)
+    row_widths: list[int] = [4]
+    for o in orders:
+        status_label = _label(ORDER_STATUS_LABELS, o.status, db_user.language_code)
+        line = (
+            f"\n📱 <code>{escape(str(o.phone_number))}</code>\n"
+            f"📲 الخدمة: {escape(str(o.service))}\n"
+            f"📊 الحالة: {status_label} | 💰 <b>{o.price_sell_usd}$</b>\n"
+            f"📅 {o.purchased_at.strftime('%Y-%m-%d %H:%M')}"
+        )
+        if o.sms_code:
+            line += f'\n🔑 الكود: <code>{escape(str(o.sms_code))}</code>'
+        if o.extra_codes:
+            line += f'\n🔑 أكواد إضافية: <code>{escape(str(o.extra_codes))}</code>'
+        lines.append(line)
+        kb.button(text=f'🧾 إيصال #{o.id}', callback_data=f'receipt:number:{o.id}')
+        if o.status == OrderStatus.PENDING:
+            # الطلب ما زال ينتظر الكود: أقصر طريق للتحديث بدل البحث عنه
+            kb.button(text='🔄 تحديث الكود', callback_data=f'num_refresh:{o.id}', style="success")
+        kb.button(text='🔁 أرقام مشابهة', callback_data=f'num_svc:{o.service}', style="primary")
+        row_widths.append(3 if o.status == OrderStatus.PENDING else 2)
+    if page > 0:
+        kb.button(text='◀️ السابق', callback_data=f'my_num_orders:{page - 1}{suffix}')
+    if page < total_pages - 1:
+        kb.button(text='التالي ▶️', callback_data=f'my_num_orders:{page + 1}{suffix}')
+    kb.button(text='🔙 رجوع لحسابي', callback_data='menu:account')
+    row_widths.append(2)
+    kb.adjust(*row_widths, 1)
+    await callback.message.edit_text('\n'.join(lines), reply_markup=kb.as_markup())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith('my_uni_orders:'))
+async def my_unified_orders(callback: CallbackQuery, session, db_user: User):
+    page, status_filter = _parse_orders_page(callback.data)
+    _label_text, statuses = UNIFIED_FILTERS[status_filter]
+    per_page = 5
+    where = [UnifiedOrder.user_id == db_user.id]
+    if statuses:
+        where.append(UnifiedOrder.status.in_(statuses))
+    result = await session.execute(select(UnifiedOrder).options(selectinload(UnifiedOrder.product)).where(*where).order_by(desc(UnifiedOrder.created_at)).limit(per_page).offset(page * per_page))
+    orders = result.scalars().all()
+    total_result = await session.execute(select(func.count(UnifiedOrder.id)).where(*where))
+    total = total_result.scalar_one()
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    suffix = f":{status_filter}"
+    if not orders and page == 0:
+        kb = InlineKeyboardBuilder()
+        _add_filter_row(kb, "my_uni_orders", status_filter, UNIFIED_FILTERS)
+        kb.adjust(2)
+        empty_text = (
+            I18nService.t('ux_account_250_3', _auto_lang(locals()))
+            if status_filter == "all"
+            else "📭 لا توجد طلبات بهذه الحالة."
+        )
+        await callback.message.edit_text(
+            empty_text,
+            reply_markup=_merge_kb(
+                kb.as_markup(),
+                empty_state_kb(language=db_user.language_code, back_callback='store:home'),
+            ),
+        )
+        await callback.answer()
+        return
+    lines = [f'🛒 <b>طلبات أخرى ({page + 1}/{total_pages})</b>\n']
+    for o in orders:
+        status_label = _label(UNIFIED_STATUS_LABELS, o.status, db_user.language_code)
+        product_name = o.product.name_ar if o.product else '—'
+        line = (
+            f"\n🆔 #{o.id}\n"
+            f"📦 المنتج: {escape(str(product_name))}\n"
+            f"📊 الحالة: {status_label} | 💰 <b>{o.price_usd}$</b>\n"
+            f"📅 {o.created_at.strftime('%Y-%m-%d %H:%M')}"
+        )
+        if o.target:
+            line += f'\n🎯 الهدف: <code>{escape(str(o.target))}</code>'
+        lines.append(line)
+    kb = InlineKeyboardBuilder()
+    _add_filter_row(kb, "my_uni_orders", status_filter, UNIFIED_FILTERS)
+    for order in orders:
+        kb.button(text=f'🔎 تفاصيل #{order.id}', callback_data=f'my_uni_order:{order.id}', style="primary")
+        kb.button(text='🔁 إعادة الطلب', callback_data=f'repeat_order:{order.id}', style="success")
+    if page > 0:
+        kb.button(text='◀️ السابق', callback_data=f'my_uni_orders:{page - 1}{suffix}')
+    if page < total_pages - 1:
+        kb.button(text='التالي ▶️', callback_data=f'my_uni_orders:{page + 1}{suffix}')
+    kb.button(text='🔙 رجوع لحسابي', callback_data='menu:account')
+    # صفّ الفلاتر (2×2) ثم صفّ لكل طلب (تفاصيل + إعادة) ثم التنقل ثم الرجوع
+    kb.adjust(2, 2, *([2] * max(1, len(orders))), 2, 1)
+    await callback.message.edit_text('\n'.join(lines), reply_markup=kb.as_markup())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith('my_uni_order:'))
+async def unified_order_detail(callback: CallbackQuery, session, db_user: User):
+    order_id = int(callback.data.split(':')[1])
+    result = await session.execute(select(UnifiedOrder).options(selectinload(UnifiedOrder.product)).where(UnifiedOrder.id == order_id, UnifiedOrder.user_id == db_user.id))
+    order = result.scalar_one_or_none()
+    if order is None:
+        await callback.answer(I18nService.t('ux_account_309_4', _auto_lang(locals())), show_alert=True)
+        return
+    status_label = _label(UNIFIED_STATUS_LABELS, order.status, db_user.language_code)
+    product_name = order.product.name_ar if order.product else '—'
+    from services.html_guard import esc
+    text = f"🛒 <b>تفاصيل الطلب #{order.id}</b>\n\n📦 المنتج: <b>{esc(product_name)}</b>\n📊 الحالة: {esc(status_label)}\n💰 المبلغ: <b>{order.price_usd}$</b>\n🎯 الهدف: <code>{esc(order.target) or '—'}</code>\n📊 الكمية: {order.quantity}\n🆔 رقم المزود: <code>{esc(order.external_order_id) or '—'}</code>\n📝 الحالة التفصيلية: {esc(order.status_message) or '—'}\n📅 التاريخ: {order.created_at.strftime('%Y-%m-%d %H:%M')}"
+    if order.remains is not None:
+        text += f'\n⏳ المتبقي: {order.remains}'
+    delivery_result = await session.execute(select(DigitalInventoryItem).where(DigitalInventoryItem.unified_order_id == order.id))
+    delivery_item = delivery_result.scalar_one_or_none()
+    if delivery_item is not None:
+        try:
+            delivery_value = InventoryService.decrypt_value(delivery_item.encrypted_value)
+            text += f'\n\n🎁 <b>بيانات التسليم:</b>\n<code>{escape(delivery_value)}</code>'
+        except InventoryError:
+            text += '\n\n⚠️ تعذر عرض بيانات التسليم حالياً.'
+    kb = InlineKeyboardBuilder()
+    if order.status == UnifiedOrderStatus.COMPLETED and order.product_id is not None:
+        review_result = await session.execute(select(ProductReview).where(ProductReview.user_id == db_user.id, ProductReview.product_id == order.product_id))
+        if review_result.scalar_one_or_none() is None:
+            kb.button(text='⭐ قيّم هذا المنتج', callback_data=f'review:start:{order.id}')
+    if order.status in (UnifiedOrderStatus.PENDING, UnifiedOrderStatus.PROCESSING, UnifiedOrderStatus.PARTIAL) and order.external_order_id:
+        kb.button(text='🔄 تحديث الحالة', callback_data=f'order_refresh:{order.id}', style="success")
+    kb.button(text='🔁 إعادة الطلب', callback_data=f'repeat_order:{order.id}', style="primary")
+    kb.button(text='🧾 الإيصال', callback_data=f'receipt:unified:{order.id}')
+    kb.button(text='🔙 رجوع للطلبات', callback_data='my_uni_orders:0')
+    kb.button(text='🏠 القائمة الرئيسية', callback_data='back_to_main')
+    kb.adjust(1)
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith('receipt:unified:'))
+async def unified_receipt(callback: CallbackQuery, session, db_user: User):
+    order_id = int(callback.data.split(':')[2])
+    result = await session.execute(select(UnifiedOrder).options(selectinload(UnifiedOrder.product)).where(UnifiedOrder.id == order_id, UnifiedOrder.user_id == db_user.id))
+    order = result.scalar_one_or_none()
+    if order is None:
+        await callback.answer(I18nService.t('ux_account_378_5', _auto_lang(locals())), show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.answer(ReceiptService.unified_text(order, db_user, order.product))
+
+
+@router.callback_query(F.data.startswith('order_refresh:'))
+async def refresh_unified_order(callback: CallbackQuery, session, db_user: User, bot=None):
+    """يسأل المزوّد عن آخر حالة لطلب لم يكتمل بعد ويحدّث الشاشة.
+
+    «سيتم إشعارك عند اكتمال الخدمة» وعد لا يكتمل إلا بفحص؛ هذا الزر
+    يعطي الزبون الفحص الفوري بدل الانتظار.
+    """
+    from datetime import datetime as _dt
+
+    from protocols.base import normalize_order_status
+    from protocols.factory import ProtocolFactory
+
+    order_id = int(callback.data.split(':')[1])
+    result = await session.execute(
+        select(UnifiedOrder)
+        .options(selectinload(UnifiedOrder.product), selectinload(UnifiedOrder.api_provider))
+        .where(UnifiedOrder.id == order_id, UnifiedOrder.user_id == db_user.id)
+    )
+    order = result.scalar_one_or_none()
+    if order is None:
+        await callback.answer(I18nService.t('ux_account_309_4', _auto_lang(locals())), show_alert=True)
+        return
+    if order.status in (UnifiedOrderStatus.COMPLETED, UnifiedOrderStatus.FAILED, UnifiedOrderStatus.REFUNDED):
+        await callback.answer('الطلب انتهت حالته ولا يحتاج تحديثاً.', show_alert=True)
+        return
+    if not order.external_order_id or order.api_provider is None:
+        await callback.answer('هذا الطلب يُسلَّم يدوياً ولا يمكن فحصه آلياً.', show_alert=True)
+        return
+
+    try:
+        protocol = ProtocolFactory.create_from_provider(order.api_provider)
+        status = await protocol.check_order_status(order.external_order_id)
+    except Exception:  # noqa: BLE001 - المزود قد يتعذر مؤقتاً
+        await callback.answer('تعذّر الاتصال بالمزوّد الآن، جرّب بعد قليل.', show_alert=True)
+        return
+
+    mapped = normalize_order_status(getattr(status, 'status', '') or '')
+    new_status = {
+        'completed': UnifiedOrderStatus.COMPLETED,
+        'partial': UnifiedOrderStatus.PARTIAL,
+        'processing': UnifiedOrderStatus.PROCESSING,
+        'failed': UnifiedOrderStatus.FAILED,
+        'refunded': UnifiedOrderStatus.REFUNDED,
+    }.get(mapped)
+    if getattr(status, 'remains', None) is not None:
+        order.remains = status.remains
+    if getattr(status, 'start_count', None) is not None:
+        order.start_count = status.start_count
+    finished = False
+    if new_status is not None and new_status != order.status:
+        order.status = new_status
+        if new_status == UnifiedOrderStatus.COMPLETED:
+            order.completed_at = order.completed_at or _dt.utcnow()
+            finished = True
+    await session.commit()
+
+    if finished and bot is not None:
+        try:
+            await bot.send_message(
+                db_user.telegram_id,
+                ReceiptService.unified_text(order, db_user, order.product),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    await callback.answer(
+        '🎉 اكتمل طلبك وأرسلنا لك الإيصال.'
+        if finished
+        else 'آخر حالة من المزوّد: ' + _label(UNIFIED_STATUS_LABELS, order.status, db_user.language_code),
+        show_alert=finished,
+    )
+    # إعادة رسم نفس الشاشة بالحالة الجديدة
+    await unified_order_detail(callback, session, db_user)
+
+
+
+@router.callback_query(F.data.startswith('receipt:number:'))
+async def number_order_receipt(callback: CallbackQuery, session, db_user: User):
+    """إيصال طلب الرقم (كان ReceiptService.number_text بلا أي زر يستخدمه)."""
+    order_id = int(callback.data.split(':')[2])
+    result = await session.execute(select(NumberOrder).where(NumberOrder.id == order_id, NumberOrder.user_id == db_user.id))
+    order = result.scalar_one_or_none()
+    if order is None:
+        await callback.answer(I18nService.t('ux_account_309_4', _auto_lang(locals())), show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.answer(ReceiptService.number_text(order, db_user))
+
+
+@router.callback_query(F.data.startswith('repeat_order:'))
+async def repeat_order(callback: CallbackQuery, session, db_user: User, state: FSMContext):
+    order_id = int(callback.data.split(':')[1])
+    result = await session.execute(select(UnifiedOrder).options(selectinload(UnifiedOrder.product)).where(UnifiedOrder.id == order_id, UnifiedOrder.user_id == db_user.id))
+    order = result.scalar_one_or_none()
+    if order is None or not order.product or order.product.status != ProductStatus.ACTIVE:
+        await callback.answer(I18nService.t('ux_account_402_6', _auto_lang(locals())), show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(product_id=order.product_id, target=order.target or '', quantity=order.quantity or 1)
+    await callback.answer()
+    await callback.message.edit_text(f"{I18nService.t('ux_account_412_7', _auto_lang(locals()))}{order.product.name_ar}{I18nService.t('ux_account_412_8', _auto_lang(locals()))}{order.target or '—'}{I18nService.t('ux_account_412_9', _auto_lang(locals()))}{order.quantity}{I18nService.t('ux_account_412_10', _auto_lang(locals()))}", reply_markup=product_confirm_kb(order.product_id, order.product.sub_category_id))
+
+@router.callback_query(F.data == 'repeat_last')
+async def repeat_last_order(callback: CallbackQuery, session, db_user: User, state: FSMContext):
+    """إعادة آخر طلب بضغطة واحدة من شاشة حسابي (المتجر أولاً ثم الأرقام)."""
+    result = await session.execute(
+        select(UnifiedOrder)
+        .options(selectinload(UnifiedOrder.product))
+        .where(UnifiedOrder.user_id == db_user.id, UnifiedOrder.product_id.is_not(None))
+        .order_by(desc(UnifiedOrder.created_at))
+        .limit(1)
+    )
+    order = result.scalar_one_or_none()
+    if order is not None and order.product and order.product.status == ProductStatus.ACTIVE:
+        await state.clear()
+        await state.update_data(product_id=order.product_id, target=order.target or '', quantity=order.quantity or 1)
+        await callback.answer()
+        await callback.message.edit_text(
+            f"{I18nService.t('ux_account_412_7', _auto_lang(locals()))}{order.product.name_ar}"
+            f"{I18nService.t('ux_account_412_8', _auto_lang(locals()))}{order.target or '—'}"
+            f"{I18nService.t('ux_account_412_9', _auto_lang(locals()))}{order.quantity}"
+            f"{I18nService.t('ux_account_412_10', _auto_lang(locals()))}",
+            reply_markup=product_confirm_kb(order.product_id, order.product.sub_category_id),
+        )
+        return
+
+    # لا طلب متجر صالح → آخر رقم مطلوب يفتح نفس الخدمة
+    num_result = await session.execute(
+        select(NumberOrder)
+        .where(NumberOrder.user_id == db_user.id)
+        .order_by(desc(NumberOrder.purchased_at))
+        .limit(1)
+    )
+    last_number = num_result.scalar_one_or_none()
+    if last_number is not None:
+        await callback.answer()
+        await callback.message.edit_text(
+            "🔁 <b>إعادة آخر طلب</b>\n\n"
+            "آخر عملية لك كانت رقمًا. اختر الدولة المناسبة من نفس الخدمة:",
+            reply_markup=empty_state_kb(
+                language=db_user.language_code,
+                back_callback=f'num_svc:{last_number.service}',
+                back_label='📞 متابعة نفس الخدمة',
+                search=False,
+            ),
+        )
+        return
+
+    await callback.answer('لا يوجد طلب سابق لإعادته.', show_alert=True)
+
+
+
+@router.callback_query(F.data.startswith('my_transactions:'))
+async def my_transactions(callback: CallbackQuery, session, db_user: User):
+    page = int(callback.data.split(':')[1])
+    per_page = 8
+    transactions = await BalanceService.get_transactions(session, db_user.id, limit=per_page, offset=page * per_page)
+    from sqlalchemy import select as sa_select, func as sa_func
+    from database.models import Transaction
+    total_result = await session.execute(sa_select(sa_func.count(Transaction.id)).where(Transaction.user_id == db_user.id))
+    total = total_result.scalar_one()
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    if not transactions and page == 0:
+        await callback.message.edit_text(
+            I18nService.t('ux_account_450_11', _auto_lang(locals())),
+            reply_markup=empty_state_kb(
+                language=db_user.language_code, back_callback='menu:account', back_label='🔙 رجوع لحسابي', search=False,
+            ),
+        )
+        await callback.answer()
+        return
+    lines = [f'📊 <b>سجل المعاملات ({page + 1}/{total_pages})</b>\n']
+    for tx in transactions:
+        tx_label = _label(TRANSACTION_TYPE_LABELS, tx.type.value, db_user.language_code)
+        sign = '+' if tx.amount > 0 else ''
+        line = f"\n{tx_label}\nالمبلغ: {sign}{tx.amount:.4f}$\nالرصيد بعدها: {tx.balance_after:.2f}$\nالتاريخ: {tx.created_at.strftime('%Y-%m-%d %H:%M')}"
+        if tx.description:
+            line += f'\n📝 {tx.description[:50]}'
+        lines.append(line)
+    kb = InlineKeyboardBuilder()
+    if page > 0:
+        kb.button(text='◀️ السابق', callback_data=f'my_transactions:{page - 1}')
+    if page < total_pages - 1:
+        kb.button(text='التالي ▶️', callback_data=f'my_transactions:{page + 1}')
+    kb.button(text='🔙 رجوع لحسابي', callback_data='menu:account')
+    kb.adjust(2, 1)
+    await callback.message.edit_text('\n'.join(lines), reply_markup=kb.as_markup())
+    await callback.answer()
