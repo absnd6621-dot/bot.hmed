@@ -34,6 +34,8 @@ jobs:
       - name: Fast subset (money guards + limits)
         run: |
           python -m pytest tests/test_p0_money_guards.py tests/test_api_rate_limit.py -q
+      - name: Navigation activity regression
+        run: python -m pytest tests/test_user_activity_performance.py -q
       - name: pip-audit (informational)
         continue-on-error: true
         run: |
