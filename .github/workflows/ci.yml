@@ -112,3 +112,6 @@ jobs:
       - name: Money guards on PostgreSQL
         run: |
           python -m pytest tests/test_p0_money_guards.py -q
+
+      - name: PostgreSQL order status regression
+        run: python -m pytest tests/test_postgres_orderstatus.py -q
