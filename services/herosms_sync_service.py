@@ -468,6 +468,7 @@ class SyncReport:
             f"♻️ تم تحديث بياناتها: <b>{len(self.updated)}</b>",
             f"🟢 دول تم تفعيلها لوجود مخزون: <b>{self.activated}</b>",
             f"⚪ دول بدون مخزون (معطلة): <b>{self.skipped_no_stock}</b>",
+            f"⚠️ دول تعذر حفظها: <b>{self.failed}</b>",
         ]
         if self.added:
             lines.append("")
@@ -618,57 +619,55 @@ async def sync_herosms_countries(
 
     await asyncio.gather(*(_probe_country(c) for c in catalog))
 
-    # 3. حفظ وتحديث الدول في قاعدة البيانات
+    # 3. A savepoint per country keeps a bad row from poisoning the batch.
     for cid, eng in english_names.items():
         try:
+            if not cid.isascii() or not cid.isdigit() or len(cid) > 16:
+                raise ValueError("Invalid HeroSMS country ID")
             has_stock = availability.get(cid, False)
             name_ar, flag = _label_for(eng)
             slug = _slugify(eng)
-
-            # البحث عن دولة موجودة بنفس كود HeroSMS حصراً.
-            # ممنوع الدمج العابر للمزودين: كل مزود له صفوفه الخاصة حتى لو
-            # تكررت الدولة — حذف الكل وإعادة السحب لا يخلط الأكواد أبداً.
-            res = await session.execute(
-                select(Country).where(Country.herosms_code == cid)
-            )
-            country = res.scalar_one_or_none()
-
-            if country is not None:
-                changed = False
-                if not country.name_ar or country.name_ar.startswith("HeroSMS") or not _is_arabic(country.name_ar):
-                    country.name_ar = name_ar
-                    changed = True
-                if country.flag in (None, "", "🌍") and flag != "🌍":
-                    country.flag = flag
-                    changed = True
-                if activate and has_stock and not country.is_active:
-                    country.is_active = True
-                    report.activated += 1
-                    changed = True
-                if changed:
-                    report.updated.append(f"{country.flag} {country.name_ar}")
-                continue
-
-            # دولة جديدة: معرف فريد باسم المزود لمنع أي التباس
-            final_slug = f"herosms_{slug}_{cid}"
-            is_active = bool(activate and has_stock)
-            new_country = Country(
-                code=final_slug,
-                name_ar=name_ar,
-                flag=flag,
-                herosms_code=cid,
-                is_active=is_active,
-            )
-            session.add(new_country)
-            report.added.append(f"{flag} {name_ar}")
-            if is_active:
-                report.activated += 1
-            else:
-                report.skipped_no_stock += 1
-
-        except Exception as e:
+            # Keep the provider ID intact for uniqueness, and stay within
+            # Country.code and NumberOrder.country_code's 32-character limits.
+            prefix, suffix = "herosms_", f"_{cid}"
+            final_slug = prefix + slug[:32 - len(prefix) - len(suffix)].rstrip("_") + suffix
+            added = updated = activated = skipped = False
+            async with session.begin_nested():
+                res = await session.execute(
+                    select(Country).where(Country.herosms_code == cid)
+                )
+                country = res.scalar_one_or_none()
+                if country is not None:
+                    if not country.name_ar or country.name_ar.startswith("HeroSMS") or not _is_arabic(country.name_ar):
+                        country.name_ar = name_ar
+                        updated = True
+                    if country.flag in (None, "", "🌍") and flag != "🌍":
+                        country.flag = flag
+                        updated = True
+                    if activate and has_stock and not country.is_active:
+                        country.is_active = True
+                        activated = updated = True
+                else:
+                    activated = bool(activate and has_stock)
+                    skipped = not activated
+                    country = Country(
+                        code=final_slug, name_ar=name_ar, flag=flag,
+                        herosms_code=cid, is_active=activated,
+                    )
+                    session.add(country)
+                    added = True
+                # Force constraint errors inside the savepoint, before counting.
+                await session.flush()
+                label = f"{country.flag} {country.name_ar}"
+            if added:
+                report.added.append(label)
+            if updated:
+                report.updated.append(label)
+            report.activated += int(activated)
+            report.skipped_no_stock += int(skipped)
+        except Exception:
             report.failed += 1
-            logger.error(f"خطأ سحب دولة #{cid}: {e}")
+            logger.exception("خطأ سحب دولة #%s", cid)
 
     await session.commit()
     return report
