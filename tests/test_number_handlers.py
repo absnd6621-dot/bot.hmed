@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -267,7 +268,8 @@ async def test_number_refresh_delivers_received_code(monkeypatch):
 @pytest.mark.asyncio
 async def test_confirm_long_country_code_fits_pending_order_id(monkeypatch):
     user_id, service_code, country_code = await _seed_number_catalog("10")
-    long_code = "herosms_central_african_repu_125"
+    # The PostgreSQL CI jobs share a database with earlier sync tests.
+    long_code = "hs_" + uuid4().hex[:29]
     assert len(long_code) == 32
     async with async_session_maker() as session:
         country = (await session.execute(select(Country).where(Country.code == country_code))).scalar_one()
