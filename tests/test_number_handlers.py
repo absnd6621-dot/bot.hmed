@@ -280,7 +280,7 @@ async def test_confirm_long_country_code_fits_pending_order_id(monkeypatch):
         return {ProviderName.FIVESIM: Decimal("1.00")}
 
     async def fake_buy(service, country, session=None, preferred_provider=None):
-        order = (await session.execute(select(NumberOrder))).scalar_one()
+        order = (await session.execute(select(NumberOrder).where(NumberOrder.user_id == user_id, NumberOrder.country_code == long_code))).scalar_one()
         assert len(order.idempotency_key) <= 64
         assert len(order.provider_order_id) <= 64
         assert order.status_message
@@ -292,6 +292,6 @@ async def test_confirm_long_country_code_fits_pending_order_id(monkeypatch):
     async with async_session_maker() as session:
         user = await session.get(User, user_id)
         await confirm_buy(DummyCallback(f"num_confirm:{service_code}:{long_code}:"), session, user, DummyBot())
-        order = (await session.execute(select(NumberOrder))).scalar_one()
+        order = (await session.execute(select(NumberOrder).where(NumberOrder.user_id == user_id, NumberOrder.country_code == long_code))).scalar_one()
         assert order.provider_order_id == "provider-order-1"
         assert order.status_message is None
