@@ -115,3 +115,5 @@ jobs:
 
       - name: PostgreSQL order status regression
         run: python -m pytest tests/test_postgres_orderstatus.py -q
+      - name: PostgreSQL HeroSMS sync regression
+        run: python -m pytest tests/test_herosms_sync_regression.py -q

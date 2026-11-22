@@ -4,6 +4,8 @@
 مع دعم السحب التلقائي، الإضافة اليدوية، والتهيئة الكاملة.
 """
 
+import logging
+
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -29,6 +31,7 @@ from keyboards.admin import (
 )
 from filters.admin_filter import IsAdmin
 
+logger = logging.getLogger(__name__)
 router = Router(name="admin_countries")
 router.message.filter(IsAdmin())
 router.callback_query.filter(IsAdmin())
@@ -318,7 +321,7 @@ async def _run_herosms_sync(
         f"⏳ <b>جاري سحب وفحص الدول من HeroSMS...</b>\n\n"
         f"الخدمات: {labels}\n"
         f"التفعيل التلقائي: {'🟢 نعم' if activate else '⚪ لا'}\n\n"
-        "قد تستغرق العملية بضع ثوانٍ..."
+        "قد تستغرق العملية عدة دقائق حسب سرعة المزود وعدد الدول..."
     )
     try:
         await callback.message.edit_text(status_text)
@@ -332,8 +335,10 @@ async def _run_herosms_sync(
             activate=activate,
         )
         text = report.summary()
-    except Exception as e:
-        text = f"❌ <b>فشل السحب من HeroSMS:</b>\n\n<code>{type(e).__name__}: {e}</code>"
+    except Exception:
+        await session.rollback()
+        logger.exception("فشل سحب دول HeroSMS")
+        text = "❌ <b>فشل السحب من HeroSMS.</b> راجع سجل الأخطاء وحاول مجدداً."
 
     countries = await get_all_countries(session)
     try:
