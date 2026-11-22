@@ -117,3 +117,7 @@ jobs:
         run: python -m pytest tests/test_postgres_orderstatus.py -q
       - name: PostgreSQL HeroSMS sync regression
         run: python -m pytest tests/test_herosms_sync_regression.py -q
+      - name: PostgreSQL number purchase intent regression
+        run: python -m pytest tests/test_number_intent_regression.py -q
+      - name: PostgreSQL long country purchase regression
+        run: python -m pytest tests/test_number_handlers.py::test_confirm_long_country_code_fits_pending_order_id -q

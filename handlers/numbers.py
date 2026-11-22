@@ -1045,7 +1045,8 @@ async def confirm_buy(
     # فأي انهيار يترك أثراً قابلاً للتسوية بدل خصم بلا طلب.
     import uuid as _uuid
 
-    intent_key = f"num:{db_user.id}:{service_code}:{country_code}:{_uuid.uuid4().hex}"
+    # Both this key and the pending provider ID must fit their VARCHAR(64) columns.
+    intent_key = f"num:{_uuid.uuid4().hex}"
     intent_provider = strict_provider or preferred_provider or cheapest_provider
     order = NumberOrder(
         user_id=db_user.id,

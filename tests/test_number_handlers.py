@@ -262,3 +262,34 @@ async def test_number_refresh_delivers_received_code(monkeypatch):
     assert order.sms_code == "123456"
     assert order.full_sms_text == "Your code is 123456"
     assert order.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_confirm_long_country_code_fits_pending_order_id(monkeypatch):
+    user_id, service_code, country_code = await _seed_number_catalog("10")
+    long_code = "herosms_central_african_repu_125"
+    assert len(long_code) == 32
+    async with async_session_maker() as session:
+        country = (await session.execute(select(Country).where(Country.code == country_code))).scalar_one()
+        country.code = long_code
+        await session.commit()
+
+    async def fake_prices(service, country, session=None):
+        return {ProviderName.FIVESIM: Decimal("1.00")}
+
+    async def fake_buy(service, country, session=None, preferred_provider=None):
+        order = (await session.execute(select(NumberOrder))).scalar_one()
+        assert len(order.idempotency_key) <= 64
+        assert len(order.provider_order_id) <= 64
+        assert order.status_message
+        return FakeBuyResult()
+
+    monkeypatch.setattr("handlers.numbers.provider_manager.get_cheapest_price", fake_prices)
+    monkeypatch.setattr("handlers.numbers.provider_manager.buy_number", fake_buy)
+    monkeypatch.setattr("services.notification_service.NotificationService.notify_admin", _noop)
+    async with async_session_maker() as session:
+        user = await session.get(User, user_id)
+        await confirm_buy(DummyCallback(f"num_confirm:{service_code}:{long_code}:"), session, user, DummyBot())
+        order = (await session.execute(select(NumberOrder))).scalar_one()
+        assert order.provider_order_id == "provider-order-1"
+        assert order.status_message is None
