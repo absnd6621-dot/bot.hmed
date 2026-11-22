@@ -8,7 +8,7 @@
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery
@@ -100,8 +100,12 @@ class UserMiddleware(BaseMiddleware):
         if user.language_code != language_code:
             user.language_code = language_code
             updated = True
-        user.last_activity_at = datetime.utcnow()
-        updated = True
+        # Persist activity at most once a minute rather than committing on
+        # every page/button press. Profile changes still commit immediately.
+        now = datetime.utcnow()
+        if user.last_activity_at is None or now - user.last_activity_at >= timedelta(minutes=1):
+            user.last_activity_at = now
+            updated = True
         if updated:
             await session.commit()
 
